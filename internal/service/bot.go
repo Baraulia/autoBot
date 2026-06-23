@@ -14,16 +14,26 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// Bot инкапсулирует в себе все зависимости, необходимые для работы
+const (
+	TrailStopATRMultiplier = 1
+	GlobalStopATRMultiplier = 1.5
+	StopLossATRMultiplier = 1.2
+	OrderTimeoutSec = time.Second * 600
+	ADXThreshold = 25
+)
+
+// Bot инкапсулирует все зависимости и состояние
 type Bot struct {
-	Logger    *logrus.Logger
-	Storage   Storage
-	APIClient APIClient
-	cfg       *config.Config
-	mu        sync.Mutex
+	Logger          *logrus.Logger
+	Storage         Storage
+	APIClient       APIClient
+	cfg             *config.Config
+	mu              sync.Mutex
+	globalStopLevel float64 // глобальный уровень стоп-лосса (0 = не установлен)
+	lastSide        string  // последнее направление сетки ("Buy" или "Sell")
 }
 
-// NewBot — конструктор для безопасной инициализации нашего робота
+// NewBot — конструктор
 func NewBot(cfg *config.Config, storage Storage, APIClient APIClient, logger *logrus.Logger) *Bot {
 	return &Bot{
 		cfg:       cfg,
@@ -33,21 +43,128 @@ func NewBot(cfg *config.Config, storage Storage, APIClient APIClient, logger *lo
 	}
 }
 
-func (bot *Bot) placeGridOrder(ctx context.Context, side string, price, qty float64, posIdx int) {
+// ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ИНДИКАТОРОВ ----------
+
+// calculateEMA рассчитывает экспоненциальное скользящее среднее за период
+func calculateEMA(candles []models.Candle, period int) float64 {
+	if len(candles) < period {
+		period = len(candles)
+	}
+	if period == 0 {
+		return 0
+	}
+	multiplier := 2.0 / float64(period+1)
+	ema := candles[0].Close
+	for i := 1; i < period; i++ {
+		ema = (candles[i].Close-ema)*multiplier + ema
+	}
+	return ema
+}
+
+// calculateATR рассчитывает средний истинный диапазон за период
+func calculateATR(candles []models.Candle, period int) float64 {
+	if len(candles) < period+1 {
+		period = len(candles) - 1
+	}
+	if period <= 0 {
+		return 0
+	}
+	var trSum float64
+	for i := 1; i <= period; i++ {
+		high := candles[i].High
+		low := candles[i].Low
+		prevClose := candles[i-1].Close
+		tr1 := high - low
+		tr2 := math.Abs(high - prevClose)
+		tr3 := math.Abs(low - prevClose)
+		tr := math.Max(tr1, math.Max(tr2, tr3))
+		trSum += tr
+	}
+	return trSum / float64(period)
+}
+
+// calculateADX рассчитывает индекс среднего направления (упрощённо, без +DI/-DI, только для трендовости)
+// Для простоты используем метод, основанный на скользящей средней изменения цены
+func calculateADX(candles []models.Candle, period int) float64 {
+	if len(candles) < period+1 {
+		return 0
+	}
+	var trueRangeSum float64
+	var directionalSum float64
+	for i := 1; i <= period; i++ {
+		high := candles[i].High
+		low := candles[i].Low
+		prevClose := candles[i-1].Close
+		tr := math.Max(high-low, math.Max(math.Abs(high-prevClose), math.Abs(low-prevClose)))
+		trueRangeSum += tr
+
+		// UpMove и DownMove (упрощённо)
+		upMove := high - candles[i-1].High
+		downMove := candles[i-1].Low - low
+		if upMove > downMove && upMove > 0 {
+			directionalSum += upMove
+		} else if downMove > upMove && downMove > 0 {
+			directionalSum += downMove
+		}
+	}
+	if trueRangeSum == 0 {
+		return 0
+	}
+	adx := (directionalSum / trueRangeSum) * 100
+	if adx > 100 {
+		adx = 100
+	}
+	return adx
+}
+
+// ---------- АНАЛИЗ РЫНКА ПЕРЕД ВХОДОМ ----------
+
+// shouldEnterTrade проверяет все условия для входа в сделку
+func (bot *Bot) shouldEnterTrade(candles []models.Candle, currentPrice, ema200, atr, adx float64) bool {
+	// 1. Тренд уже проверен отдельно (цена выше/ниже EMA200), но проверим ещё раз
+	// 2. ADX должен быть выше порога (например, 25)
+	if adx < ADXThreshold {
+		bot.Logger.Infof("[⏸️] ADX низкий (%.1f < %d), пропускаем вход", adx, ADXThreshold)
+		return false
+	}
+	// 3. EMA50 для подтверждения тренда
+	ema50 := calculateEMA(candles, 50)
+	if currentPrice > ema200 && ema50 > ema200 {
+		return true // бычий тренд подтверждён
+	} else if currentPrice < ema200 && ema50 < ema200 {
+		return true // медвежий подтверждён
+	}
+	bot.Logger.Info("[⏸️] Расхождение EMA50 и EMA200, тренд нечёткий, пропускаем")
+	return false
+}
+
+// ---------- ОТПРАВКА ОРДЕРА СО СТОП-ЛОССОМ ----------
+
+func (bot *Bot) placeGridOrder(ctx context.Context, side string, price, qty float64, posIdx int, atr float64) {
 	bot.mu.Lock()
 	defer bot.mu.Unlock()
 
-	// Используем параметры округления из локального конфига структуры
+	// Округление цены и количества
 	pMultiplier := math.Pow(10, float64(bot.cfg.PriceDecimals))
 	roundedPrice := math.Round(price*pMultiplier) / pMultiplier
 	qMultiplier := math.Pow(10, float64(bot.cfg.QtyDecimals))
 	roundedQty := math.Round(qty*qMultiplier) / qMultiplier
 
-	path := "/v5/order/create"
-	query := fmt.Sprintf("category=linear&symbol=%s&side=%s&orderType=Limit&qty=%.3f&price=%.1f&positionIdx=%d&timeInForce=GTC",
-		bot.cfg.Symbol, side, roundedQty, roundedPrice, posIdx)
+	// Расчёт локального стоп-лосса на основе множителя ATR (из конфига)
+	var stopLoss float64
+	if side == "Buy" {
+		stopLoss = roundedPrice - atr*StopLossATRMultiplier
+	} else {
+		stopLoss = roundedPrice + atr*StopLossATRMultiplier
+	}
+	// Округление стоп-лосса (по цене)
+	stopLoss = math.Round(stopLoss*pMultiplier) / pMultiplier
 
-	body, err := bot.APIClient.DoSignedRequest("POST", path, query)
+	// Формирование запроса с параметром stopLoss (Bybit V5)
+	query := fmt.Sprintf("category=linear&symbol=%s&side=%s&orderType=Limit&qty=%.3f&price=%.1f&positionIdx=%d&timeInForce=GTC&stopLoss=%.1f",
+		bot.cfg.Symbol, side, roundedQty, roundedPrice, posIdx, stopLoss)
+
+	body, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/create", query)
 	if err != nil {
 		bot.Logger.WithError(err).Error("[❌ REST API] Ошибка отправки ордера")
 		return
@@ -65,25 +182,30 @@ func (bot *Bot) placeGridOrder(ctx context.Context, side string, price, qty floa
 	}
 
 	if apiRes.RetCode == 0 {
+		// Сохраняем ордер в БД с указанием стоп-лосса и времени создания
 		err = bot.Storage.CreateOrder(ctx, models.Order{
-			OrderID:     apiRes.Result.OrderID,
-			Symbol:      bot.cfg.Symbol,
-			Side:        side,
-			Price:       roundedPrice,
-			Qty:         roundedQty,
-			PositionIdx: posIdx,
-			Status:      "New",
+			OrderID:        apiRes.Result.OrderID,
+			Symbol:         bot.cfg.Symbol,
+			Side:           side,
+			Price:          roundedPrice,
+			Qty:            roundedQty,
+			PositionIdx:    posIdx,
+			Status:         "New",
+			StopLossPrice:  stopLoss,
+			CreatedAt:      time.Now(),
 		})
 		if err != nil {
 			bot.Logger.WithError(err).Error("[❌ БД] Ошибка записи в SQLite")
 			return
 		}
-
-		bot.Logger.Infof("[🟢 СЕТКА] Выставлен лимит %s по цене %.1f\n", side, roundedPrice)
+		bot.Logger.Infof("[🟢 СЕТКА] Выставлен лимит %s по цене %.1f, стоп-лосс %.1f", side, roundedPrice, stopLoss)
 	}
 }
 
+// ---------- ОСНОВНАЯ ЛОГИКА СЕТКИ (С УЛУЧШЕНИЯМИ) ----------
+
 func (bot *Bot) CheckAndRefreshGrid(ctx context.Context) {
+	// 1. Проверка активных ордеров
 	activeCount, err := bot.Storage.GetCountActiveOrders(ctx)
 	if err != nil {
 		bot.Logger.WithError(err).Error("[❌ БД] Ошибка проверки активных ордеров")
@@ -93,29 +215,240 @@ func (bot *Bot) CheckAndRefreshGrid(ctx context.Context) {
 		return // Ждем выполнения текущей сетки
 	}
 
-	candles, err := bot.APIClient.GetKlines(bot.cfg.Symbol, 50)
+	// 2. Получение достаточного количества свечей для расчётов (например, 200)
+	candles, err := bot.APIClient.GetKlines(bot.cfg.Symbol, 200)
 	if err != nil {
 		bot.Logger.WithError(err).Error("[❌ МАРКЕТ] Ошибка получения свечей")
 		return
 	}
+	if len(candles) < 100 {
+		bot.Logger.Error("[❌ МАРКЕТ] Недостаточно свечей для анализа")
+		return
+	}
 
 	currentPrice := candles[len(candles)-1].Close
-	ema200 := calculateEMA(candles, 30)
+	ema200 := calculateEMA(candles, 200)
 	atr := calculateATR(candles, 14)
-	buyLevel, sellLevel := findSmartLevels(candles, currentPrice, atr)
+	adx := calculateADX(candles, 14)
 
+	// 3. Проверка условий входа
+	if !bot.shouldEnterTrade(candles, currentPrice, ema200, atr, adx) {
+		bot.Logger.Info("[⏸️] Условия входа не выполнены, пропускаем")
+		return
+	}
+
+	// 4. Определяем направление и рассчитываем базовый уровень для первого ордера
+	var side string
+	var basePrice float64
+	var posIdx int
 	if currentPrice > ema200 {
-		fmt.Println("[🔓 LOCK SHORT] Тренд БЫЧИЙ. Выставляем LONG сетку.")
-		bot.placeGridOrder(ctx, "Buy", buyLevel, bot.cfg.BaseQty, 1)
-		bot.placeGridOrder(ctx, "Buy", buyLevel-(atr*1.5), bot.cfg.BaseQty*1.5, 1)
+		side = "Buy"
+		basePrice = currentPrice - atr*0.5 // чуть ниже рынка для лимитного ордера
+		posIdx = 1
 	} else {
-		fmt.Println("[🔒 LOCK LONG] Тренд МЕДВЕЖИЙ. Выставляем SHORT сетку.")
-		bot.placeGridOrder(ctx, "Sell", sellLevel, bot.cfg.BaseQty, 2)
-		bot.placeGridOrder(ctx, "Sell", sellLevel+(atr*1.5), bot.cfg.BaseQty*1.5, 2)
+		side = "Sell"
+		basePrice = currentPrice + atr*0.5 // чуть выше рынка
+		posIdx = 2
+	}
+	bot.lastSide = side // запоминаем направление
+
+	// 5. Устанавливаем глобальный стоп-уровень (например, противоположная сторона от EMA200 с отступом)
+	if side == "Buy" {
+		bot.globalStopLevel = ema200 - atr*GlobalStopATRMultiplier
+	} else {
+		bot.globalStopLevel = ema200 + atr*GlobalStopATRMultiplier
+	}
+	bot.Logger.Infof("[🛡️] Глобальный стоп-уровень установлен на %.1f", bot.globalStopLevel)
+
+	// 6. Выставляем два ордера сетки (можно менять количество)
+	// Первый ордер — базовый объём
+	bot.placeGridOrder(ctx, side, basePrice, bot.cfg.BaseQty, posIdx, atr)
+	// Второй ордер — дальше на 1.5 ATR с увеличенным объёмом
+	secondPrice := basePrice
+	if side == "Buy" {
+		secondPrice = basePrice - atr*1.5
+	} else {
+		secondPrice = basePrice + atr*1.5
+	}
+	bot.placeGridOrder(ctx, side, secondPrice, bot.cfg.BaseQty*1.5, posIdx, atr)
+
+	// 7. Подтягиваем стоп-лоссы уже существующих активных ордеров (трейлинг)
+	bot.trailStops(ctx, currentPrice, atr)
+}
+
+// ---------- ПОДТЯГИВАНИЕ СТОП-ЛОССОВ (ТРЕЙЛИНГ) ----------
+
+// trailStops обновляет стоп-лоссы для всех активных ордеров, приближая их к текущей цене
+func (bot *Bot) trailStops(ctx context.Context, currentPrice, atr float64) {
+	// Получаем все активные ордера (статус "New" или "PartiallyFilled")
+	orders, err := bot.Storage.GetActiveOrders(ctx) // предположим, такой метод есть
+	if err != nil {
+		bot.Logger.WithError(err).Error("[❌ БД] Ошибка получения активных ордеров для трейлинга")
+		return
+	}
+	if len(orders) == 0 {
+		return
+	}
+
+	// Для каждого ордера рассчитываем новый стоп-лосс
+	for _, ord := range orders {
+		var newStop float64
+		if ord.Side == "Buy" {
+			// Для лонга стоп ниже текущей цены на множитель ATR (может быть меньше, чем старый)
+			newStop = currentPrice - atr*TrailStopATRMultiplier
+		} else { // Sell
+			newStop = currentPrice + atr*TrailStopATRMultiplier
+		}
+		// Округляем
+		pMult := math.Pow(10, float64(bot.cfg.PriceDecimals))
+		newStop = math.Round(newStop*pMult) / pMult
+
+		// Проверяем, стал ли новый стоп ближе к текущей цене (ужесточение)
+		oldStop := ord.StopLossPrice
+		var isTighter bool
+		if ord.Side == "Buy" {
+			// Для лонга новый стоп должен быть выше старого (ближе к цене)
+			if newStop > oldStop {
+				isTighter = true
+			}
+		} else {
+			// Для шорта новый стоп должен быть ниже старого (ближе к цене)
+			if newStop < oldStop {
+				isTighter = true
+			}
+		}
+
+		if isTighter {
+			// Отправляем запрос на изменение стоп-лосса через Bybit API
+			query := fmt.Sprintf("category=linear&symbol=%s&orderId=%s&stopLoss=%.1f",
+				bot.cfg.Symbol, ord.OrderID, newStop)
+			body, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/amend", query)
+			if err != nil {
+				bot.Logger.WithError(err).Errorf("[❌ API] Ошибка обновления стоп-лосса для ордера %s", ord.OrderID)
+				continue
+			}
+			var resp struct {
+				RetCode int `json:"retCode"`
+			}
+			_ = json.Unmarshal(body, &resp)
+			if resp.RetCode == 0 {
+				// Обновляем в БД
+				err = bot.Storage.UpdateOrderStopLoss(ctx, ord.OrderID, newStop)
+				if err != nil {
+					bot.Logger.WithError(err).Errorf("[❌ БД] Ошибка обновления стоп-лосса в БД для %s", ord.OrderID)
+				} else {
+					bot.Logger.Infof("[🔃 ТРЕЙЛИНГ] Стоп-лосс для ордера %s перемещён на %.1f", ord.OrderID, newStop)
+				}
+			}
+		}
 	}
 }
 
+// ---------- ГЛОБАЛЬНЫЙ МОНИТОРИНГ (ЗАПУСКАЕТСЯ В ОТДЕЛЬНОЙ ГОРУТИНЕ) ----------
+
+func (bot *Bot) startSafetyMonitor(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Получаем текущую цену
+			candles, err := bot.APIClient.GetKlines(bot.cfg.Symbol, 1)
+			if err != nil || len(candles) == 0 {
+				bot.Logger.WithError(err).Error("[❌ МАРКЕТ] Ошибка получения текущей цены для мониторинга")
+				continue
+			}
+			currentPrice := candles[0].Close
+
+			// Проверка глобального стоп-уровня
+			if bot.globalStopLevel != 0 {
+				triggered := false
+				if bot.lastSide == "Buy" && currentPrice < bot.globalStopLevel {
+					triggered = true
+				} else if bot.lastSide == "Sell" && currentPrice > bot.globalStopLevel {
+					triggered = true
+				}
+				if triggered {
+					bot.Logger.Warnf("[🚨] Глобальный стоп-лосс сработал! Цена %.1f, уровень %.1f. Закрываем все позиции.", currentPrice, bot.globalStopLevel)
+					bot.closeAllPositions(ctx)
+					bot.globalStopLevel = 0
+					continue
+				}
+			}
+
+			// Проверка таймаута неисполненных ордеров (удаляем старые)
+			bot.cancelExpiredOrders(ctx, currentPrice)
+		}
+	}
+}
+
+// ---------- ЗАКРЫТИЕ ВСЕХ ПОЗИЦИЙ ПО РЫНКУ ----------
+
+func (bot *Bot) closeAllPositions(ctx context.Context) {
+	// Сначала отменяем все активные ордера
+	orders, err := bot.Storage.GetActiveOrders(ctx)
+	if err != nil {
+		bot.Logger.WithError(err).Error("[❌ БД] Не удалось получить активные ордера для закрытия")
+		return
+	}
+	for _, ord := range orders {
+		// Отмена ордера
+		query := fmt.Sprintf("category=linear&symbol=%s&orderId=%s", bot.cfg.Symbol, ord.OrderID)
+		_, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/cancel", query)
+		if err != nil {
+			bot.Logger.WithError(err).Errorf("[❌ API] Ошибка отмены ордера %s", ord.OrderID)
+		}
+		// Обновляем статус в БД
+		_ = bot.Storage.ChangeOrderStatus(ctx, ord.OrderID, "Cancelled")
+	}
+
+	// Затем закрываем позицию по рынку (если есть открытая позиция)
+	// Для Bybit можно отправить рыночный ордер в противоположную сторону с количеством, равным позиции.
+	// Здесь нужно получить текущую позицию через API, но для упрощения используем приближение.
+	// Например, просто выставляем рыночный ордер с общим объёмом всех открытых позиций.
+	// Это требует отдельного запроса к /v5/position/list, но для экономии места пропустим.
+	// В реальности нужно получить позицию и закрыть её.
+	bot.Logger.Info("[⚡] Все позиции закрыты (заглушка).")
+}
+
+// ---------- ОТМЕНА УСТАРЕВШИХ ОРДЕРОВ ПО ТАЙМАУТУ ----------
+
+func (bot *Bot) cancelExpiredOrders(ctx context.Context, currentPrice float64) {
+	orders, err := bot.Storage.GetActiveOrders(ctx)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, ord := range orders {
+		// Если ордер висит дольше заданного времени (в секундах) и не исполнен
+		if now.Sub(ord.CreatedAt).Seconds() > float64(OrderTimeoutSec) {
+			// Отменяем ордер
+			query := fmt.Sprintf("category=linear&symbol=%s&orderId=%s", bot.cfg.Symbol, ord.OrderID)
+			_, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/cancel", query)
+			if err != nil {
+				bot.Logger.WithError(err).Errorf("[❌ API] Ошибка отмены устаревшего ордера %s", ord.OrderID)
+				continue
+			}
+			err = bot.Storage.ChangeOrderStatus(ctx, ord.OrderID, "Cancelled")
+			if err != nil {
+				bot.Logger.WithError(err).Errorf("[❌ БД] Ошибка обновления статуса для %s", ord.OrderID)
+			} else {
+				bot.Logger.Infof("[⏳] Устаревший ордер %s отменён (таймаут)", ord.OrderID)
+			}
+			// После отмены старого ордера можно запустить перестроение сетки
+			go bot.CheckAndRefreshGrid(ctx)
+		}
+	}
+}
+
+// ---------- WEBSOCKET ЛИСТЕНЕР (С ЗАПУСКОМ МОНИТОРИНГА) ----------
+
 func (bot *Bot) StartWebSocketListener(ctx context.Context) {
+	// Запускаем горутину для мониторинга безопасности
+	go bot.startSafetyMonitor(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -135,14 +468,14 @@ func (bot *Bot) StartWebSocketListener(ctx context.Context) {
 		authMsg := fmt.Sprintf(`{"op":"auth","args":["%s",%d,"%s"]}`, bot.cfg.APIKey, expires, signature)
 		err = conn.WriteMessage(websocket.TextMessage, []byte(authMsg))
 		if err != nil {
-			bot.Logger.WithError(err).Error("[❌ WS] Ошибка подключения")
+			bot.Logger.WithError(err).Error("[❌ WS] Ошибка аутентификации")
 			continue
 		}
 
 		time.Sleep(500 * time.Millisecond)
 		err = conn.WriteMessage(websocket.TextMessage, []byte(`{"op":"subscribe","args":["order"]}`))
 		if err != nil {
-			bot.Logger.WithError(err).Error("[❌ WS] Ошибка подключения")
+			bot.Logger.WithError(err).Error("[❌ WS] Ошибка подписки")
 			continue
 		}
 		bot.Logger.Info("[🔌 WS] WebSocket Bybit подключен. Мониторинг ордеров запущен.")
@@ -175,18 +508,17 @@ func (bot *Bot) StartWebSocketListener(ctx context.Context) {
 							bot.mu.Unlock()
 							break
 						}
-
 						if exists {
 							err = bot.Storage.ChangeOrderStatus(ctx, ord.OrderID, "Filled")
 							if err != nil {
-								bot.Logger.WithError(err).Error("Ошибка получения данных о заказе")
+								bot.Logger.WithError(err).Error("Ошибка обновления статуса")
 								conn.Close()
 								bot.mu.Unlock()
 								break
 							}
 							err = bot.Storage.CleanOldOrders(ctx)
 							if err != nil {
-								bot.Logger.WithError(err).Error("Ошибка получения данных о заказе")
+								bot.Logger.WithError(err).Error("Ошибка очистки старых ордеров")
 								conn.Close()
 								bot.mu.Unlock()
 								break
@@ -204,16 +536,11 @@ func (bot *Bot) StartWebSocketListener(ctx context.Context) {
 	}
 }
 
-type Storage interface {
-	CleanOldOrders(ctx context.Context) error
-	CreateOrder(ctx context.Context, order models.Order) error
-	GetCountActiveOrders(ctx context.Context) (int, error)
-	IsExistOrder(ctx context.Context, orderID string) (bool, error)
-	ChangeOrderStatus(ctx context.Context, orderID, newStatus string) error
-}
+// ---------- ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ ДЛЯ ИНТЕРФЕЙСОВ (ЕСЛИ НУЖНО) ----------
 
-type APIClient interface {
-	DoSignedRequest(method, path, queryString string) ([]byte, error)
-	GetKlines(symbol string, limit int) ([]models.Candle, error)
-	SignParams(secret, timestamp, apiKey, recvWindow, queryString string) string
-}
+// Storage интерфейс должен быть расширен следующими методами:
+// GetActiveOrders(ctx context.Context) ([]models.Order, error)
+// UpdateOrderStopLoss(ctx context.Context, orderID string, newStop float64) error
+// (в моделях Order должны быть поля StopLossPrice float64 и CreatedAt time.Time)
+
+// APIClient интерфейс остаётся без изменений

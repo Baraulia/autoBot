@@ -1,7 +1,10 @@
 package models
 
+import "time"
+
 // Candle описывает базовую японскую свечу для расчетов
 type Candle struct {
+	Open  float64
 	High  float64
 	Low   float64
 	Close float64
@@ -16,4 +19,6 @@ type Order struct {
 	Qty         float64
 	PositionIdx int
 	Status      string
+	StopLossPrice  float64
+	CreatedAt      time.Time
 }

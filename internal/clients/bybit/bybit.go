@@ -1,7 +1,6 @@
-package bybit
+package api
 
 import (
-	"auto-bot/config"
 	"auto-bot/internal/models"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -9,113 +8,125 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
+	"net/http"	
 	"strconv"
+	"strings"
 	"time"
 )
 
-type ByBitClient struct {
-	BaseURL   string
-	APIKey    string
-	APISecret string
+type BybitClient struct {
+	apiKey    string
+	apiSecret string
+	baseURL   string // например, "https://api.bybit.com"
+	httpClient *http.Client
 }
 
-func NewByBitClient(cfg *config.Config) *ByBitClient {
-	return &ByBitClient{
-		BaseURL:   cfg.BaseURL,
-		APIKey:    cfg.APIKey,
-		APISecret: cfg.APISecret,
+func NewBybitClient(apiKey, apiSecret, baseURL string) *BybitClient {
+	return &BybitClient{
+		apiKey:     apiKey,
+		apiSecret:  apiSecret,
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-type BybitResponse struct {
-	RetCode int    `json:"retCode"`
-	RetMsg  string `json:"retMsg"`
-	Result  struct {
-		List [][]string `json:"list"`
-	} `json:"result"`
-}
-
-// Генерация подписи HMAC-SHA256 под требования Bybit V5
-func (c *ByBitClient) SignParams(secret, timestamp, apiKey, recvWindow, queryString string) string {
-	val := timestamp + apiKey + recvWindow + queryString
+// SignParams генерирует подпись для запроса (используется для REST и WebSocket)
+func (c *BybitClient) SignParams(secret, timestamp, apiKey, recvWindow, queryString string) string {
+	// Для GET-запросов queryString уже содержит параметры, для POST – обычно тело (но в нашем случае queryString – это часть URL)
+	// Формат подписи Bybit: timestamp + apiKey + recvWindow + queryString
+	data := timestamp + apiKey + recvWindow + queryString
 	h := hmac.New(sha256.New, []byte(secret))
-	h.Write([]byte(val))
+	h.Write([]byte(data))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Выполнение подписанного REST-запроса к Bybit с явной передачей доступов
-func (c *ByBitClient) DoSignedRequest(method, path, queryString string) ([]byte, error) {
+// DoSignedRequest выполняет подписанный запрос к Bybit V5
+func (c *BybitClient) DoSignedRequest(method, path, queryString string) ([]byte, error) {
+	urlStr := c.baseURL + path
+	req, err := http.NewRequest(method, urlStr, strings.NewReader(queryString))
+	if err != nil {
+		return nil, err
+	}
+
+	// Заголовки
 	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	recvWindow := "5000"
+	signature := c.SignParams(c.apiSecret, timestamp, c.apiKey, recvWindow, queryString)
 
-	var fullURL string
-	if method == "GET" && queryString != "" {
-		fullURL = c.BaseURL + path + "?" + queryString
-	} else {
-		fullURL = c.BaseURL + path
-	}
-
-	req, err := http.NewRequest(method, fullURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка создания HTTP-запроса: %w", err)
-	}
-
-	// Установка обязательных заголовков Bybit V5
-	req.Header.Set("X-BAPI-API-KEY", c.APIKey)
+	req.Header.Set("X-BAPI-API-KEY", c.apiKey)
 	req.Header.Set("X-BAPI-TIMESTAMP", timestamp)
+	req.Header.Set("X-BAPI-SIGN", signature)
 	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
-	req.Header.Set("X-BAPI-SIGN", c.SignParams(c.APISecret, timestamp, c.APIKey, recvWindow, queryString))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	// Инициализируем изолированный клиент с таймаутом
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	// Для POST запросов тело отправляем как строку
+	if method == "POST" {
+		req.Body = io.NopCloser(strings.NewReader(queryString))
+	} else {
+		// Для GET параметры обычно в URL, но у нас они уже переданы в queryString
+		req.URL.RawQuery = queryString
+	}
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("сетевая ошибка при отправке запроса: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("ошибка чтения ответа сервера: %w", err)
+		return nil, err
 	}
-
 	return body, nil
 }
 
-// Запрос исторических свечей (Клайнов) с автоматическим разворотом массива хронологии
-func (c *ByBitClient) GetKlines(symbol string, limit int) ([]models.Candle, error) {
-	path := "/v5/market/kline"
-	query := fmt.Sprintf("category=linear&symbol=%s&interval=240&limit=%d", symbol, limit) // 4H свечи
+// GetKlines получает историю свечей (публичный эндпоинт, не требует подписи)
+func (c *BybitClient) GetKlines(symbol string, limit int) ([]models.Candle, error) {
+	// Параметры: category=linear, interval=5 (или из конфига), limit
+	interval := "5" // можно вынести в конфиг
+	urlStr := fmt.Sprintf("%s/v5/market/kline?category=linear&symbol=%s&interval=%s&limit=%d",
+		c.baseURL, symbol, interval, limit)
 
-	resp, err := http.Get(c.BaseURL + path + "?" + query)
+	resp, err := http.Get(urlStr)
 	if err != nil {
-		return nil, fmt.Errorf("не удалось выполнить запрос свечей: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("ошибка чтения тела свечей: %w", err)
+		return nil, err
 	}
 
-	var res BybitResponse
-	if err := json.Unmarshal(body, &res); err != nil {
-		return nil, fmt.Errorf("ошибка парсинга JSON свечей: %w", err)
+	var result struct {
+		RetCode int `json:"retCode"`
+		Result  struct {
+			List [][]string `json:"list"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	if result.RetCode != 0 {
+		return nil, fmt.Errorf("bybit api error: retCode=%d", result.RetCode)
 	}
 
-	if res.RetCode != 0 {
-		return nil, fmt.Errorf("биржа вернула ошибку: %s (код %d)", res.RetMsg, res.RetCode)
-	}
-
+	// Парсим список свечей: [timestamp, open, high, low, close, volume, turnover]
 	var candles []models.Candle
-	// Разворачиваем ответ, так как Bybit отдает массив от новых к старым
-	for i := len(res.Result.List) - 1; i >= 0; i-- {
-		item := res.Result.List[i]
-		high, _ := strconv.ParseFloat(item[2], 64)   // 2 — это High
-		low, _ := strconv.ParseFloat(item[3], 64)    // 3 — это Low
-		closeP, _ := strconv.ParseFloat(item[4], 64) // 4 — это Close
-		candles = append(candles, models.Candle{High: high, Low: low, Close: closeP})
+	for _, item := range result.Result.List {
+		if len(item) < 5 {
+			continue
+		}
+		open, _ := strconv.ParseFloat(item[1], 64)
+		high, _ := strconv.ParseFloat(item[2], 64)
+		low, _ := strconv.ParseFloat(item[3], 64)
+		close, _ := strconv.ParseFloat(item[4], 64)
+		candles = append(candles, models.Candle{
+			Open:  open,
+			High:  high,
+			Low:   low,
+			Close: close,
+		})
 	}
 	return candles, nil
 }

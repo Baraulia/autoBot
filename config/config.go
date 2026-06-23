@@ -18,6 +18,7 @@ type Config struct {
 	BaseQty       float64
 	QtyDecimals   int
 	PriceDecimals int
+	DBPAth string
 }
 
 // LoadConfig читает файл .env и возвращает заполненную структуру конфигурации
@@ -83,6 +84,7 @@ func LoadConfig(filepath string) (*Config, error) {
 		BaseQty:       baseQty,
 		QtyDecimals:   qtyDecimals,
 		PriceDecimals: priceDecimals,
+		DBPAth: envMap["DB_PATH"],
 	}
 
 	return cfg, nil
