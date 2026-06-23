@@ -15,12 +15,12 @@ import (
 )
 
 const (
-	TrailStopATRMultiplier = 1
+	TrailStopATRMultiplier  = 1
 	GlobalStopATRMultiplier = 1.5
-	StopLossATRMultiplier = 1.2
-	OrderTimeoutSec = time.Second * 600
-	ADXThreshold = 25
-	PaperInitialBalance = 1000
+	StopLossATRMultiplier   = 1.2
+	OrderTimeoutSec         = time.Second * 600
+	ADXThreshold            = 25
+	PaperInitialBalance     = 1000
 )
 
 // Bot инкапсулирует все зависимости и состояние
@@ -30,26 +30,26 @@ type Bot struct {
 	APIClient       APIClient
 	cfg             *config.Config
 	mu              sync.Mutex
-	globalStopLevel float64 // глобальный уровень стоп-лосса (0 = не установлен)
-	lastSide        string 		 // последнее направление сетки ("Buy" или "Sell")
-	paperBalance   float64          // текущий виртуальный баланс
-    paperPositions map[string]*Position // открытые позиции: symbol -> количество (для упрощения, можно хранить в БД)
-    paperStats     PaperStats       // статистика
+	globalStopLevel float64              // глобальный уровень стоп-лосса (0 = не установлен)
+	lastSide        string               // последнее направление сетки ("Buy" или "Sell")
+	paperBalance    float64              // текущий виртуальный баланс
+	paperPositions  map[string]*Position // открытые позиции: symbol -> количество (для упрощения, можно хранить в БД)
+	paperStats      PaperStats           // статистика
 }
 
 type Position struct {
-    Symbol      string
-    Qty         float64 // положительное – лонг, отрицательное – шорт (если поддерживается)
-    AvgPrice    float64 // средняя цена входа
+	Symbol   string
+	Qty      float64 // положительное – лонг, отрицательное – шорт (если поддерживается)
+	AvgPrice float64 // средняя цена входа
 }
 
 type PaperStats struct {
-    TotalTrades   int
-    WinTrades     int
-    LossTrades    int
-    TotalProfit   float64   // суммарная реализованная прибыль (USDT)
-    MaxDrawdown   float64   // максимальная просадка в процентах
-    PeakBalance   float64   // пиковый баланс
+	TotalTrades int
+	WinTrades   int
+	LossTrades  int
+	TotalProfit float64 // суммарная реализованная прибыль (USDT)
+	MaxDrawdown float64 // максимальная просадка в процентах
+	PeakBalance float64 // пиковый баланс
 }
 
 // NewBot — конструктор
@@ -58,7 +58,7 @@ func NewBot(cfg *config.Config, storage Storage, APIClient APIClient, logger *lo
 		cfg:       cfg,
 		Storage:   storage,
 		APIClient: APIClient,
-		Logger:    logger,		
+		Logger:    logger,
 	}
 }
 
@@ -160,72 +160,72 @@ func (bot *Bot) shouldEnterTrade(candles []models.Candle, currentPrice, ema200, 
 // ---------- ОТПРАВКА ОРДЕРА СО СТОП-ЛОССОМ ----------
 
 func (bot *Bot) placeGridOrder(ctx context.Context, side string, price, qty float64, posIdx int, atr float64) {
-    bot.mu.Lock()
-    defer bot.mu.Unlock()
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
 
-    // Округление (как было)
-    pMultiplier := math.Pow(10, float64(bot.cfg.PriceDecimals))
-    roundedPrice := math.Round(price*pMultiplier) / pMultiplier
-    qMultiplier := math.Pow(10, float64(bot.cfg.QtyDecimals))
-    roundedQty := math.Round(qty*qMultiplier) / qMultiplier
+	// Округление (как было)
+	pMultiplier := math.Pow(10, float64(bot.cfg.PriceDecimals))
+	roundedPrice := math.Round(price*pMultiplier) / pMultiplier
+	qMultiplier := math.Pow(10, float64(bot.cfg.QtyDecimals))
+	roundedQty := math.Round(qty*qMultiplier) / qMultiplier
 
-    // Расчёт локального стоп-лосса
-    var stopLoss float64
-    if side == "Buy" {
-        stopLoss = roundedPrice - atr*StopLossATRMultiplier
-    } else {
-        stopLoss = roundedPrice + atr*StopLossATRMultiplier
-    }
-    stopLoss = math.Round(stopLoss*pMultiplier) / pMultiplier
+	// Расчёт локального стоп-лосса
+	var stopLoss float64
+	if side == "Buy" {
+		stopLoss = roundedPrice - atr*StopLossATRMultiplier
+	} else {
+		stopLoss = roundedPrice + atr*StopLossATRMultiplier
+	}
+	stopLoss = math.Round(stopLoss*pMultiplier) / pMultiplier
 
-    var orderID string
-    if bot.cfg.PaperMode {
-        // Генерируем локальный ID (например, на основе времени)
-        orderID = fmt.Sprintf("PAPER_%d", time.Now().UnixNano())
-        // В бумажном режиме не отправляем запрос, просто сохраняем
-        bot.Logger.Infof("[📝 БУМАГА] Размещён лимит %s по цене %.1f, стоп-лосс %.1f (виртуально)", side, roundedPrice, stopLoss)
-    } else {
-        // Реальный режим: отправляем запрос и получаем orderID
-        query := fmt.Sprintf("category=linear&symbol=%s&side=%s&orderType=Limit&qty=%.3f&price=%.1f&positionIdx=%d&timeInForce=GTC&stopLoss=%.1f",
-            bot.cfg.Symbol, side, roundedQty, roundedPrice, posIdx, stopLoss)
-        body, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/create", query)
-        if err != nil {
-            bot.Logger.WithError(err).Error("[❌ REST API] Ошибка отправки ордера")
-            return
-        }
-        var apiRes struct {
-            RetCode int `json:"retCode"`
-            Result  struct {
-                OrderID string `json:"orderId"`
-            } `json:"result"`
-        }
-        if err := json.Unmarshal(body, &apiRes); err != nil {
-            bot.Logger.WithError(err).Error("[❌ JSON] Ошибка десериализации")
-            return
-        }
-        if apiRes.RetCode != 0 {
-            bot.Logger.Errorf("[❌ API] Ошибка создания ордера, retCode=%d", apiRes.RetCode)
-            return
-        }
-        orderID = apiRes.Result.OrderID
-        bot.Logger.Infof("[🟢 СЕТКА] Выставлен лимит %s по цене %.1f, стоп-лосс %.1f", side, roundedPrice, stopLoss)
-    }
+	var orderID string
+	if bot.cfg.PaperMode {
+		// Генерируем локальный ID (например, на основе времени)
+		orderID = fmt.Sprintf("PAPER_%d", time.Now().UnixNano())
+		// В бумажном режиме не отправляем запрос, просто сохраняем
+		bot.Logger.Infof("[📝 БУМАГА] Размещён лимит %s по цене %.1f, стоп-лосс %.1f (виртуально)", side, roundedPrice, stopLoss)
+	} else {
+		// Реальный режим: отправляем запрос и получаем orderID
+		query := fmt.Sprintf("category=linear&symbol=%s&side=%s&orderType=Limit&qty=%.3f&price=%.1f&positionIdx=%d&timeInForce=GTC&stopLoss=%.1f",
+			bot.cfg.Symbol, side, roundedQty, roundedPrice, posIdx, stopLoss)
+		body, err := bot.APIClient.DoSignedRequest(ctx, "POST", "/v5/order/create", query)
+		if err != nil {
+			bot.Logger.WithError(err).Error("[❌ REST API] Ошибка отправки ордера")
+			return
+		}
+		var apiRes struct {
+			RetCode int `json:"retCode"`
+			Result  struct {
+				OrderID string `json:"orderId"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(body, &apiRes); err != nil {
+			bot.Logger.WithError(err).Error("[❌ JSON] Ошибка десериализации")
+			return
+		}
+		if apiRes.RetCode != 0 {
+			bot.Logger.Errorf("[❌ API] Ошибка создания ордера, retCode=%d", apiRes.RetCode)
+			return
+		}
+		orderID = apiRes.Result.OrderID
+		bot.Logger.Infof("[🟢 СЕТКА] Выставлен лимит %s по цене %.1f, стоп-лосс %.1f", side, roundedPrice, stopLoss)
+	}
 
-    // Сохраняем в БД
-    err := bot.Storage.CreateOrder(ctx, models.Order{
-        OrderID:        orderID,
-        Symbol:         bot.cfg.Symbol,
-        Side:           side,
-        Price:          roundedPrice,
-        Qty:            roundedQty,
-        PositionIdx:    posIdx,
-        Status:         "New",
-        StopLossPrice:  stopLoss,
-        CreatedAt:      time.Now(),
-    })
-    if err != nil {
-        bot.Logger.WithError(err).Error("[❌ БД] Ошибка записи в SQLite")
-    }
+	// Сохраняем в БД
+	err := bot.Storage.CreateOrder(ctx, models.Order{
+		OrderID:       orderID,
+		Symbol:        bot.cfg.Symbol,
+		Side:          side,
+		Price:         roundedPrice,
+		Qty:           roundedQty,
+		PositionIdx:   posIdx,
+		Status:        "New",
+		StopLossPrice: stopLoss,
+		CreatedAt:     time.Now(),
+	})
+	if err != nil {
+		bot.Logger.WithError(err).Error("[❌ БД] Ошибка записи в SQLite")
+	}
 }
 
 // ---------- ОСНОВНАЯ ЛОГИКА СЕТКИ (С УЛУЧШЕНИЯМИ) ----------
@@ -348,7 +348,7 @@ func (bot *Bot) trailStops(ctx context.Context, currentPrice, atr float64) {
 			// Отправляем запрос на изменение стоп-лосса через Bybit API
 			query := fmt.Sprintf("category=linear&symbol=%s&orderId=%s&stopLoss=%.1f",
 				bot.cfg.Symbol, ord.OrderID, newStop)
-			body, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/amend", query)
+			body, err := bot.APIClient.DoSignedRequest(ctx, "POST", "/v5/order/amend", query)
 			if err != nil {
 				bot.Logger.WithError(err).Errorf("[❌ API] Ошибка обновления стоп-лосса для ордера %s", ord.OrderID)
 				continue
@@ -422,7 +422,7 @@ func (bot *Bot) closeAllPositions(ctx context.Context) {
 	for _, ord := range orders {
 		// Отмена ордера
 		query := fmt.Sprintf("category=linear&symbol=%s&orderId=%s", bot.cfg.Symbol, ord.OrderID)
-		_, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/cancel", query)
+		_, err := bot.APIClient.DoSignedRequest(ctx, "POST", "/v5/order/cancel", query)
 		if err != nil {
 			bot.Logger.WithError(err).Errorf("[❌ API] Ошибка отмены ордера %s", ord.OrderID)
 		}
@@ -452,7 +452,7 @@ func (bot *Bot) cancelExpiredOrders(ctx context.Context, currentPrice float64) {
 		if now.Sub(ord.CreatedAt).Seconds() > float64(OrderTimeoutSec) {
 			// Отменяем ордер
 			query := fmt.Sprintf("category=linear&symbol=%s&orderId=%s", bot.cfg.Symbol, ord.OrderID)
-			_, err := bot.APIClient.DoSignedRequest("POST", "/v5/order/cancel", query)
+			_, err := bot.APIClient.DoSignedRequest(ctx, "POST", "/v5/order/cancel", query)
 			if err != nil {
 				bot.Logger.WithError(err).Errorf("[❌ API] Ошибка отмены устаревшего ордера %s", ord.OrderID)
 				continue
@@ -473,12 +473,12 @@ func (bot *Bot) cancelExpiredOrders(ctx context.Context, currentPrice float64) {
 
 func (bot *Bot) StartWebSocketListener(ctx context.Context) {
 	// проверяем режим запуска бота
-	 if bot.cfg.PaperMode {
-        bot.Logger.Info("[📝 БУМАГА] WebSocket отключён, используется REST-симулятор.")
-        // Ждём отмены контекста
-        <-ctx.Done()
-        return
-    }
+	if bot.cfg.PaperMode {
+		bot.Logger.Info("[📝 БУМАГА] WebSocket отключён, используется REST-симулятор.")
+		// Ждём отмены контекста
+		<-ctx.Done()
+		return
+	}
 	// Запускаем горутину для мониторинга безопасности
 	go bot.startSafetyMonitor(ctx)
 
@@ -495,6 +495,11 @@ func (bot *Bot) StartWebSocketListener(ctx context.Context) {
 			time.Sleep(5 * time.Second)
 			continue
 		}
+
+		go func() {
+			<-ctx.Done()
+			conn.Close() // Это вызовет ошибку в ReadMessage, и цикл завершится
+		}()
 
 		expires := time.Now().UnixMilli() + 10000
 		signature := bot.APIClient.SignParams(bot.cfg.APISecret, fmt.Sprintf("GET/auth%d", expires), bot.cfg.APIKey, "5000", "")
@@ -571,16 +576,16 @@ func (bot *Bot) StartWebSocketListener(ctx context.Context) {
 
 // startPeriodicRebuild запускает периодическую проверку условий входа
 func (bot *Bot) StartPeriodicRebuild(ctx context.Context) {
-    ticker := time.NewTicker(5 * time.Minute)
-    defer ticker.Stop()
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            bot.Logger.Info("[⏰] Периодическая проверка условий входа...")
-            bot.CheckAndRefreshGrid(ctx)
-        }
-    }
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			bot.Logger.Info("[⏰] Периодическая проверка условий входа...")
+			bot.CheckAndRefreshGrid(ctx)
+		}
+	}
 }

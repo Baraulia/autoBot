@@ -6,8 +6,8 @@ import (
 	"database/sql"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/sirupsen/logrus"
+	_ "modernc.org/sqlite"
 )
 
 type SQLiteStorage struct {
@@ -136,8 +136,8 @@ func (s *SQLiteStorage) UpdateOrderStopLoss(ctx context.Context, orderID string,
 
 // GetFilledOrdersCount возвращает количество исполненных ордеров (статус "Filled")
 func (s *SQLiteStorage) GetFilledOrdersCount(ctx context.Context) (int, error) {
-    query := `SELECT COUNT(*) FROM orders WHERE status = 'Filled'`
-    var count int
-    err := s.db.QueryRowContext(ctx, query).Scan(&count)
-    return count, err
+	query := `SELECT COUNT(*) FROM orders WHERE status = 'Filled'`
+	var count int
+	err := s.db.QueryRowContext(ctx, query).Scan(&count)
+	return count, err
 }

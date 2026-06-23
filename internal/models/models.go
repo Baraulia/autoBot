@@ -12,13 +12,13 @@ type Candle struct {
 
 // Order представляет запись ордера в локальной СУБД
 type Order struct {
-	OrderID     string
-	Symbol      string
-	Side        string
-	Price       float64
-	Qty         float64
-	PositionIdx int
-	Status      string
-	StopLossPrice  float64
-	CreatedAt      time.Time
+	OrderID       string
+	Symbol        string
+	Side          string
+	Price         float64
+	Qty           float64
+	PositionIdx   int
+	Status        string
+	StopLossPrice float64
+	CreatedAt     time.Time
 }

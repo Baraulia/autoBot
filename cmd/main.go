@@ -38,26 +38,27 @@ func main() {
 	defer cancel()
 
 	// Запускаем бумажный симулятор (если включен)
-    if cfg.PaperMode {
-        go bot.StartPaperSimulator(ctx)
+	if cfg.PaperMode {
+		go bot.StartPaperSimulator(ctx)
 		go bot.StartStatusLogger(ctx)
-    } else {
-        go bot.StartWebSocketListener(ctx)
-    }
+	} else {
+		go bot.StartWebSocketListener(ctx)
+	}
 
-    // Первичная установка сетки (в реальном или бумажном режиме – одинакова)
-    go bot.CheckAndRefreshGrid(ctx)
-	// Запуск периодической проверки 
+	// Первичная установка сетки (в реальном или бумажном режиме – одинакова)
+	go bot.CheckAndRefreshGrid(ctx)
+	// Запуск периодической проверки
 	go bot.StartPeriodicRebuild(ctx)
 
-    // Ожидание завершения
-    sigCh := make(chan os.Signal, 1)
-    signal.Notify(sigCh, os.Interrupt)
-    <-sigCh
-    lg.Info("Получен сигнал завершения, остановка...")
-    cancel()
-    time.Sleep(2 * time.Second) // даём время завершиться горутинам
-    if cfg.PaperMode {
-        bot.PrintPaperStats()
-    }
+	// Ожидание завершения
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	<-sigCh
+	lg.Info("Получен сигнал завершения, остановка...")
+	cancel()
+
+	// Даём 5 секунд на завершение, затем принудительно выходим
+	<-time.After(5 * time.Second)
+	lg.Warn("Принудительное завершение по таймауту")
+	os.Exit(0)
 }

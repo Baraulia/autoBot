@@ -20,9 +20,9 @@ const (
 )
 
 type BybitClient struct {
-	apiKey    string
-	apiSecret string
-	baseURL   string // например, "https://api.bybit.com"
+	apiKey     string
+	apiSecret  string
+	baseURL    string // например, "https://api.bybit.com"
 	httpClient *http.Client
 }
 
@@ -46,9 +46,9 @@ func (c *BybitClient) SignParams(secret, timestamp, apiKey, recvWindow, queryStr
 }
 
 // DoSignedRequest выполняет подписанный запрос к Bybit V5
-func (c *BybitClient) DoSignedRequest(method, path, queryString string) ([]byte, error) {
+func (c *BybitClient) DoSignedRequest(ctx context.Context, method, path, queryString string) ([]byte, error) {
 	urlStr := c.baseURL + path
-	req, err := http.NewRequest(method, urlStr, strings.NewReader(queryString))
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, strings.NewReader(queryString))
 	if err != nil {
 		return nil, err
 	}
@@ -92,17 +92,17 @@ func (c *BybitClient) GetKlines(ctx context.Context, symbol string, limit int) (
 		c.baseURL, symbol, candkesInterval, limit)
 
 	// Создаём запрос с контекстом
-    req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-    if err != nil {
-        return nil, err
-    }
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
 
-    // Используем httpClient (он должен быть в структуре)
-    resp, err := c.httpClient.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
+	// Используем httpClient (он должен быть в структуре)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

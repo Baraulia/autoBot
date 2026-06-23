@@ -17,7 +17,7 @@ type Storage interface {
 }
 
 type APIClient interface {
-	DoSignedRequest(method, path, queryString string) ([]byte, error)
+	DoSignedRequest(ctx context.Context, method, path, queryString string) ([]byte, error)
 	GetKlines(ctx context.Context, symbol string, limit int) ([]models.Candle, error)
 	SignParams(secret, timestamp, apiKey, recvWindow, queryString string) string
 }
