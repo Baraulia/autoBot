@@ -13,10 +13,11 @@ type Storage interface {
 	ChangeOrderStatus(ctx context.Context, orderID, newStatus string) error
 	IsExistOrder(ctx context.Context, orderID string) (bool, error)
 	CleanOldOrders(ctx context.Context) error
+	GetFilledOrdersCount(ctx context.Context) (int, error)
 }
 
 type APIClient interface {
 	DoSignedRequest(method, path, queryString string) ([]byte, error)
-	GetKlines(symbol string, limit int) ([]models.Candle, error)
+	GetKlines(ctx context.Context, symbol string, limit int) ([]models.Candle, error)
 	SignParams(secret, timestamp, apiKey, recvWindow, queryString string) string
 }

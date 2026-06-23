@@ -47,9 +47,9 @@ type PaperStats struct {
     TotalTrades   int
     WinTrades     int
     LossTrades    int
-    TotalProfit   float64
-    MaxDrawdown   float64
-    PeakBalance   float64
+    TotalProfit   float64   // суммарная реализованная прибыль (USDT)
+    MaxDrawdown   float64   // максимальная просадка в процентах
+    PeakBalance   float64   // пиковый баланс
 }
 
 // NewBot — конструктор
@@ -242,7 +242,7 @@ func (bot *Bot) CheckAndRefreshGrid(ctx context.Context) {
 	}
 
 	// 2. Получение достаточного количества свечей для расчётов (например, 200)
-	candles, err := bot.APIClient.GetKlines(bot.cfg.Symbol, 200)
+	candles, err := bot.APIClient.GetKlines(ctx, bot.cfg.Symbol, 200)
 	if err != nil {
 		bot.Logger.WithError(err).Error("[❌ МАРКЕТ] Ошибка получения свечей")
 		return
@@ -381,7 +381,7 @@ func (bot *Bot) startSafetyMonitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 			// Получаем текущую цену
-			candles, err := bot.APIClient.GetKlines(bot.cfg.Symbol, 1)
+			candles, err := bot.APIClient.GetKlines(ctx, bot.cfg.Symbol, 1)
 			if err != nil || len(candles) == 0 {
 				bot.Logger.WithError(err).Error("[❌ МАРКЕТ] Ошибка получения текущей цены для мониторинга")
 				continue
@@ -569,11 +569,18 @@ func (bot *Bot) StartWebSocketListener(ctx context.Context) {
 	}
 }
 
-// ---------- ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ ДЛЯ ИНТЕРФЕЙСОВ (ЕСЛИ НУЖНО) ----------
+// startPeriodicRebuild запускает периодическую проверку условий входа
+func (bot *Bot) StartPeriodicRebuild(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
 
-// Storage интерфейс должен быть расширен следующими методами:
-// GetActiveOrders(ctx context.Context) ([]models.Order, error)
-// UpdateOrderStopLoss(ctx context.Context, orderID string, newStop float64) error
-// (в моделях Order должны быть поля StopLossPrice float64 и CreatedAt time.Time)
-
-// APIClient интерфейс остаётся без изменений
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            bot.Logger.Info("[⏰] Периодическая проверка условий входа...")
+            bot.CheckAndRefreshGrid(ctx)
+        }
+    }
+}

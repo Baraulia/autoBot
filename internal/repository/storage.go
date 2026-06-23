@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/sirupsen/logrus"
 )
 
@@ -16,7 +16,7 @@ type SQLiteStorage struct {
 }
 
 func NewSQLiteStorage(dbPath string, logger *logrus.Logger) (*SQLiteStorage, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -132,4 +132,12 @@ func (s *SQLiteStorage) UpdateOrderStopLoss(ctx context.Context, orderID string,
 	query := `UPDATE orders SET stop_loss_price = ? WHERE order_id = ?`
 	_, err := s.db.ExecContext(ctx, query, newStop, orderID)
 	return err
+}
+
+// GetFilledOrdersCount возвращает количество исполненных ордеров (статус "Filled")
+func (s *SQLiteStorage) GetFilledOrdersCount(ctx context.Context) (int, error) {
+    query := `SELECT COUNT(*) FROM orders WHERE status = 'Filled'`
+    var count int
+    err := s.db.QueryRowContext(ctx, query).Scan(&count)
+    return count, err
 }

@@ -2,13 +2,14 @@ package api
 
 import (
 	"auto-bot/internal/models"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"	
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -85,16 +86,23 @@ func (c *BybitClient) DoSignedRequest(method, path, queryString string) ([]byte,
 }
 
 // GetKlines получает историю свечей (публичный эндпоинт, не требует подписи)
-func (c *BybitClient) GetKlines(symbol string, limit int) ([]models.Candle, error) {
+func (c *BybitClient) GetKlines(ctx context.Context, symbol string, limit int) ([]models.Candle, error) {
 	// Параметры: category=linear, interval=5 (или из конфига), limit // можно вынести в конфиг
 	urlStr := fmt.Sprintf("%s/v5/market/kline?category=linear&symbol=%s&interval=%d&limit=%d",
 		c.baseURL, symbol, candkesInterval, limit)
 
-	resp, err := http.Get(urlStr)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	// Создаём запрос с контекстом
+    req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    // Используем httpClient (он должен быть в структуре)
+    resp, err := c.httpClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

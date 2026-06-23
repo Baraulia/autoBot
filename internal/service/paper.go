@@ -23,7 +23,7 @@ func (bot *Bot) StartPaperSimulator(ctx context.Context) {
             bot.PrintPaperStats() // выводим итоговую статистику
             return
         case <-ticker.C:
-            candles, err := bot.APIClient.GetKlines(bot.cfg.Symbol, 1)
+            candles, err := bot.APIClient.GetKlines(ctx, bot.cfg.Symbol, 1)
             if err != nil || len(candles) == 0 {
                 bot.Logger.WithError(err).Error("[❌ БУМАГА] Ошибка получения цены")
                 continue
@@ -92,6 +92,7 @@ func (bot *Bot) executePaperOrder(ctx context.Context, ord models.Order, execPri
     fee := ord.Qty * execPrice * feeRate
 
     if ord.Side == "Buy" {
+        // ... (покупка: без изменений, только обновление позиции) ...
         cost := ord.Qty * execPrice
         if bot.paperBalance < cost+fee {
             bot.Logger.Warn("[⚠️ БУМАГА] Недостаточно средств для покупки")
@@ -99,42 +100,50 @@ func (bot *Bot) executePaperOrder(ctx context.Context, ord models.Order, execPri
         }
         bot.paperBalance -= (cost + fee)
 
-        // Обновляем позицию (лонг)
         pos, exists := bot.paperPositions[ord.Symbol]
         if !exists {
             pos = &Position{Symbol: ord.Symbol, Qty: 0, AvgPrice: 0}
             bot.paperPositions[ord.Symbol] = pos
         }
-        // Новая средняя цена = (старое_количество * старая_цена + новое_количество * цена) / (старое_количество + новое_количество)
         totalQty := pos.Qty + ord.Qty
         if totalQty != 0 {
             pos.AvgPrice = (pos.Qty*pos.AvgPrice + ord.Qty*execPrice) / totalQty
-        } else {
-            pos.AvgPrice = 0
         }
         pos.Qty = totalQty
 
         bot.Logger.Infof("[🟢 БУМАГА] Исполнена покупка %s по цене %.2f, кол-во %.3f, средняя %.2f", ord.Symbol, execPrice, ord.Qty, pos.AvgPrice)
     } else { // Sell
-        // Для продажи проверяем, что есть позиция
         pos, exists := bot.paperPositions[ord.Symbol]
         if !exists || pos.Qty < ord.Qty {
             bot.Logger.Warn("[⚠️ БУМАГА] Недостаточно позиции для продажи")
             return
         }
-        revenue := ord.Qty * execPrice
-        fee = revenue * feeRate
+        // Расчёт прибыли от этой продажи (частичное или полное закрытие)
+        sellQty := ord.Qty
+        // Прибыль = (цена продажи - средняя цена входа) * количество
+        profit := (execPrice - pos.AvgPrice) * sellQty
+        // Вычитаем комиссию на продажу
+        fee = sellQty * execPrice * feeRate
+        revenue := sellQty * execPrice
         bot.paperBalance += (revenue - fee)
 
+        // Обновляем статистику
+        bot.paperStats.TotalTrades++
+        if profit > 0 {
+            bot.paperStats.WinTrades++
+        } else {
+            bot.paperStats.LossTrades++
+        }
+        bot.paperStats.TotalProfit += profit
+
         // Уменьшаем позицию
-        pos.Qty -= ord.Qty
-        // Если позиция полностью закрыта, удаляем её (или оставляем с Qty=0)
+        pos.Qty -= sellQty
         if pos.Qty == 0 {
             delete(bot.paperPositions, ord.Symbol)
         } else {
-            // Средняя цена не меняется при частичной продаже
+            // Средняя цена остаётся прежней при частичной продаже
         }
-        bot.Logger.Infof("[🔴 БУМАГА] Исполнена продажа %s по цене %.2f, кол-во %.3f", ord.Symbol, execPrice, ord.Qty)
+        bot.Logger.Infof("[🔴 БУМАГА] Исполнена продажа %s по цене %.2f, кол-во %.3f, прибыль %.2f", ord.Symbol, execPrice, sellQty, profit)
     }
 
     _ = bot.Storage.ChangeOrderStatus(ctx, ord.OrderID, "Filled")
@@ -153,23 +162,28 @@ func (bot *Bot) closePaperPosition(ctx context.Context, ord models.Order, curren
     }
     feeRate := 0.0006
     var fee float64
+    var profit float64
     if pos.Qty > 0 { // лонг
+        // Закрываем по рыночной цене (стоп-срабатывание)
         proceeds := pos.Qty * currentPrice
         fee = proceeds * feeRate
+        profit = (currentPrice - pos.AvgPrice) * pos.Qty
         bot.paperBalance += (proceeds - fee)
-        bot.paperStats.LossTrades++
-    } else { // шорт (если поддерживается) – для полноты
-        // В данной стратегии мы не используем шорт-позиции одновременно с лонг, поэтому оставим заглушку
-        // Но можно реализовать аналогично
+        bot.paperStats.TotalTrades++
+        if profit > 0 {
+            bot.paperStats.WinTrades++
+        } else {
+            bot.paperStats.LossTrades++
+        }
+        bot.paperStats.TotalProfit += profit
+        delete(bot.paperPositions, ord.Symbol)
+        bot.Logger.Warnf("[🛑 БУМАГА] Стоп-лосс сработал! Закрыта позиция %s по цене %.2f, прибыль %.2f", ord.Symbol, currentPrice, profit)
     }
-    delete(bot.paperPositions, ord.Symbol)
-    bot.paperStats.TotalTrades++
     _ = bot.Storage.ChangeOrderStatus(ctx, ord.OrderID, "Stopped")
-    bot.Logger.Warnf("[🛑 БУМАГА] Стоп-лосс сработал! Закрыта позиция %s по цене %.2f", ord.Symbol, currentPrice)
 }
 
 // closeAllPaperPositions - закрыть все позиции по рыночной цене
-func (bot *Bot) closeAllPaperPositions(_ context.Context, price float64) {
+func (bot *Bot) closeAllPaperPositions(ctx context.Context, price float64) {
     bot.mu.Lock()
     defer bot.mu.Unlock()
     feeRate := 0.0006
@@ -178,16 +192,22 @@ func (bot *Bot) closeAllPaperPositions(_ context.Context, price float64) {
             continue
         }
         var fee float64
+        var profit float64
         if pos.Qty > 0 { // лонг
             proceeds := pos.Qty * price
             fee = proceeds * feeRate
+            profit = (price - pos.AvgPrice) * pos.Qty
             bot.paperBalance += (proceeds - fee)
-        } else { // шорт
-            cost := -pos.Qty * price
-            fee = cost * feeRate
-            bot.paperBalance -= (cost + fee)
+        } else { // шорт (если поддерживается)
+            // ...
         }
         bot.paperStats.TotalTrades++
+        if profit > 0 {
+            bot.paperStats.WinTrades++
+        } else {
+            bot.paperStats.LossTrades++
+        }
+        bot.paperStats.TotalProfit += profit
     }
     bot.paperPositions = make(map[string]*Position)
     bot.Logger.Warn("[🚨 БУМАГА] Все позиции закрыты по глобальному стопу.")
@@ -218,4 +238,53 @@ func (bot *Bot) PrintPaperStats() {
     bot.Logger.Infof("Убыточных: %d", bot.paperStats.LossTrades)
     bot.Logger.Infof("Максимальная просадка: %.2f%%", bot.paperStats.MaxDrawdown)
     bot.Logger.Infof("==================================================")
+}
+
+func (bot *Bot) logStatus(ctx context.Context) {
+    if bot.cfg.PaperMode {
+        bot.mu.Lock()
+        defer bot.mu.Unlock()
+
+        candles, err := bot.APIClient.GetKlines(ctx, bot.cfg.Symbol, 1)
+        var currentPrice float64
+        if err == nil && len(candles) > 0 {
+            currentPrice = candles[0].Close
+        }
+        totalPL := bot.calcPaperPL(currentPrice)
+        currentBalance := bot.paperBalance + totalPL
+
+        bot.Logger.Infof("========== 📊 БУМАЖНЫЙ СТАТУС ==========")
+        bot.Logger.Infof("Баланс: %.2f USDT (включая нереал. P&L)", currentBalance)
+        bot.Logger.Infof("Реализованная прибыль: %.2f USDT", bot.paperStats.TotalProfit)
+        bot.Logger.Infof("Сделок: %d (прибыльных: %d, убыточных: %d)", 
+            bot.paperStats.TotalTrades, bot.paperStats.WinTrades, bot.paperStats.LossTrades)
+        bot.Logger.Infof("Макс. просадка: %.2f%%", bot.paperStats.MaxDrawdown)
+        // Можно добавить активные ордера, если нужно
+        orders, _ := bot.Storage.GetActiveOrders(ctx)
+        bot.Logger.Infof("Активных лимитных ордеров: %d", len(orders))
+        bot.Logger.Infof("========================================")
+    } else {
+        // Для реального режима можно вывести что-то подобное, но там нет статистики
+        // Можно добавить количество исполненных ордеров из БД
+        filledCount, _ := bot.Storage.GetFilledOrdersCount(ctx)
+        bot.Logger.Infof("========== 📊 РЕАЛЬНЫЙ СТАТУС ==========")
+        bot.Logger.Infof("Исполненных ордеров: %d", filledCount)
+        bot.Logger.Infof("========================================")
+    }
+}
+
+// startStatusLogger запускает периодическое логирование (раз в час)
+func (bot *Bot) StartStatusLogger(ctx context.Context) {
+    ticker := time.NewTicker(1 * time.Hour)
+    defer ticker.Stop()
+    // Сразу выведем статус при запуске
+    bot.logStatus(ctx)
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            bot.logStatus(ctx)
+        }
+    }
 }

@@ -2,7 +2,7 @@ module auto-bot
 
 go 1.26.2
 
-require modernc.org/sqlite v1.52.0
+require modernc.org/sqlite v1.53.0
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -15,7 +15,7 @@ require (
 	github.com/sirupsen/logrus v1.9.4
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.44.0
-	modernc.org/libc v1.72.3 // indirect
+	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )

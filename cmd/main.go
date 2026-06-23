@@ -40,12 +40,15 @@ func main() {
 	// Запускаем бумажный симулятор (если включен)
     if cfg.PaperMode {
         go bot.StartPaperSimulator(ctx)
+		go bot.StartStatusLogger(ctx)
     } else {
         go bot.StartWebSocketListener(ctx)
     }
 
     // Первичная установка сетки (в реальном или бумажном режиме – одинакова)
     go bot.CheckAndRefreshGrid(ctx)
+	// Запуск периодической проверки 
+	go bot.StartPeriodicRebuild(ctx)
 
     // Ожидание завершения
     sigCh := make(chan os.Signal, 1)
