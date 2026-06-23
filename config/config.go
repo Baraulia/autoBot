@@ -19,6 +19,7 @@ type Config struct {
 	QtyDecimals   int
 	PriceDecimals int
 	DBPAth string
+	PaperMode bool
 }
 
 // LoadConfig читает файл .env и возвращает заполненную структуру конфигурации
@@ -74,6 +75,10 @@ func LoadConfig(filepath string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("неверный формат TRADE_PRICE_DECIMALS: %w", err)
 	}
+	mode, err := strconv.ParseBool( envMap["PAPER_MODE"])
+	if err != nil {
+		return nil, fmt.Errorf("неверный формат PAPER_MODE: %w", err)
+	}
 
 	cfg := &Config{
 		APIKey:        envMap["BYBIT_API_KEY"],
@@ -85,6 +90,7 @@ func LoadConfig(filepath string) (*Config, error) {
 		QtyDecimals:   qtyDecimals,
 		PriceDecimals: priceDecimals,
 		DBPAth: envMap["DB_PATH"],
+		PaperMode: mode, 
 	}
 
 	return cfg, nil

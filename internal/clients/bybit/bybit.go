@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+const (
+	candkesInterval = 5
+)
+
 type BybitClient struct {
 	apiKey    string
 	apiSecret string
@@ -82,10 +86,9 @@ func (c *BybitClient) DoSignedRequest(method, path, queryString string) ([]byte,
 
 // GetKlines получает историю свечей (публичный эндпоинт, не требует подписи)
 func (c *BybitClient) GetKlines(symbol string, limit int) ([]models.Candle, error) {
-	// Параметры: category=linear, interval=5 (или из конфига), limit
-	interval := "5" // можно вынести в конфиг
-	urlStr := fmt.Sprintf("%s/v5/market/kline?category=linear&symbol=%s&interval=%s&limit=%d",
-		c.baseURL, symbol, interval, limit)
+	// Параметры: category=linear, interval=5 (или из конфига), limit // можно вынести в конфиг
+	urlStr := fmt.Sprintf("%s/v5/market/kline?category=linear&symbol=%s&interval=%d&limit=%d",
+		c.baseURL, symbol, candkesInterval, limit)
 
 	resp, err := http.Get(urlStr)
 	if err != nil {

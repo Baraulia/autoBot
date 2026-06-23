@@ -9,6 +9,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"time"
 )
 
 func main() {
@@ -36,21 +37,24 @@ func main() {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = storage.CleanOldOrders(ctx)
-	if err != nil {
-		lg.WithError(err).Fatal("очистка базы от старых заказов")
-	}
+	// Запускаем бумажный симулятор (если включен)
+    if cfg.PaperMode {
+        go bot.StartPaperSimulator(ctx)
+    } else {
+        go bot.StartWebSocketListener(ctx)
+    }
 
-	// 4. Запуск фоновых процессов
-	// Запуск WebSocket листенера
-	go bot.StartWebSocketListener(ctx)
+    // Первичная установка сетки (в реальном или бумажном режиме – одинакова)
+    go bot.CheckAndRefreshGrid(ctx)
 
-	// Первичная установка сетки
-	go bot.CheckAndRefreshGrid(ctx)
-
-	// Ожидание сигнала завершения
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-	<-sigCh
-	lg.Info("Получен сигнал завершения, остановка...")
+    // Ожидание завершения
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, os.Interrupt)
+    <-sigCh
+    lg.Info("Получен сигнал завершения, остановка...")
+    cancel()
+    time.Sleep(2 * time.Second) // даём время завершиться горутинам
+    if cfg.PaperMode {
+        bot.PrintPaperStats()
+    }
 }
